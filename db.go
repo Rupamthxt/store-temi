@@ -212,44 +212,155 @@ func (db *Database) Get(key string) (string, error) {
 	return string(valueBytes), nil
 }
 
-func main() {
-	// 1. Create/Open the database
-	dbPath := "my_test.db"
-	db, err := NewDatabase(dbPath)
+// Compact cleans up the log file by removing stale data.
+func (db *Database) Compact() error {
+	// 1. Lock the database entirely.
+	// This prevents any reads or writes while we swap files.
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	// 2. Open a temporary new file for writing
+	tempPath := db.file.Name() + ".tmp"
+	newFile, err := os.OpenFile(tempPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("failed to create temp file: %w", err)
 	}
+
+	// 3. We will iterate through the EXISTING file to find valid data.
+	// We rewind the current file to the start.
+	if _, err := db.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	var currentOffset int64 = 0
+	headerBuf := make([]byte, headerSize)
+
+	// We need a new map to track offsets in the NEW file
+	newKeyDir := make(map[string]LogEntryPointer)
+	var newOffset int64 = 0
+
+	for {
+		// --- READ STEP (Same as loadIndex) ---
+
+		// Read Header
+		if _, err := io.ReadFull(db.file, headerBuf); err == io.EOF {
+			break
+		} else if err != nil {
+			return err
+		}
+
+		timestamp := binary.BigEndian.Uint64(headerBuf[0:8])
+		keySize := binary.BigEndian.Uint32(headerBuf[8:12])
+		valueSize := binary.BigEndian.Uint32(headerBuf[12:16])
+
+		// Read Key
+		keyBytes := make([]byte, keySize)
+		if _, err := io.ReadFull(db.file, keyBytes); err != nil {
+			return err
+		}
+		key := string(keyBytes)
+
+		// Read Value
+		valueBytes := make([]byte, valueSize)
+		if _, err := io.ReadFull(db.file, valueBytes); err != nil {
+			return err
+		}
+
+		// --- DECISION STEP ---
+
+		// Calculate where the value lived in the OLD file
+		oldValueOffset := currentOffset + headerSize + int64(keySize)
+
+		// Check our current index. Does it point to THIS specific record?
+		// If db.keyDir[key].offset matches, this is the LATEST data. Keep it.
+		// If it doesn't match, it means a newer write happened later. Skip it.
+		if db.keyDir[key].offset == oldValueOffset {
+
+			// --- WRITE STEP ---
+
+			// Write to the NEW file
+			// 1. Header
+			if _, err := newFile.Write(headerBuf); err != nil {
+				return err
+			}
+			// 2. Key
+			if _, err := newFile.Write(keyBytes); err != nil {
+				return err
+			}
+			// 3. Value
+			if _, err := newFile.Write(valueBytes); err != nil {
+				return err
+			}
+
+			// Update our temporary index
+			newValueOffset := newOffset + headerSize + int64(keySize)
+			newKeyDir[key] = LogEntryPointer{
+				offset:    newValueOffset,
+				size:      valueSize,
+				timestamp: timestamp,
+			}
+
+			// Advance new file offset
+			newOffset += int64(headerSize + keySize + valueSize)
+		}
+
+		// Advance old file offset (we read header + key + value)
+		currentOffset += int64(headerSize + keySize + valueSize)
+	}
+
+	// 4. SWAP STEP
+
+	// We have written the new file. Now we need to switch over.
+
+	// Close both files
+	oldPath := db.file.Name()
+	db.file.Close()
+	newFile.Close()
+
+	// Replace the old file with the new one
+	if err := os.Rename(tempPath, oldPath); err != nil {
+		return fmt.Errorf("failed to replace old file: %w", err)
+	}
+
+	// Re-open the file (now pointing to the compacted data)
+	file, err := os.OpenFile(oldPath, os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+	db.file = file
+
+	// Replace the in-memory index
+	db.keyDir = newKeyDir
+
+	fmt.Println("Compaction complete.")
+	return nil
+}
+
+func main() {
+	dbPath := "my_test.db"
+	os.Remove(dbPath) // Start fresh
+
+	db, _ := NewDatabase(dbPath)
 	defer db.Close()
 
-	// 2. Write some data
-	fmt.Println("Writing data...")
-	if err := db.Set("user_1", "Alice"); err != nil {
-		panic(err)
+	fmt.Println("Writing updates...")
+	// Write "key1" 10,000 times
+	for i := 0; i < 10000; i++ {
+		db.Set("key1", fmt.Sprintf("value_%d", i))
 	}
-	if err := db.Set("user_2", "Bob"); err != nil {
-		panic(err)
-	}
-	// Overwrite user_1 to prove the log works (append-only update)
-	if err := db.Set("user_1", "Alice_Updated"); err != nil {
+
+	info, _ := os.Stat(dbPath)
+	fmt.Printf("File size BEFORE compaction: %d bytes\n", info.Size())
+
+	fmt.Println("Compacting...")
+	if err := db.Compact(); err != nil {
 		panic(err)
 	}
 
-	// 3. Read the data back
-	fmt.Println("Reading data...")
+	info, _ = os.Stat(dbPath)
+	fmt.Printf("File size AFTER compaction: %d bytes\n", info.Size())
 
-	val1, err := db.Get("user_1")
-	if err != nil {
-		panic(err)
-	}
-	fmt.Printf("user_1: %s (Expected: Alice_Updated)\n", val1)
-
-	val2, err := db.Get("user_2")
-	if err != nil {
-		panic(err)
-	}
-	fmt.Printf("user_2: %s (Expected: Bob)\n", val2)
-
-	// 4. Persistence Test
-	// If you run this program twice, the second time it should load the
-	// old data from the file during NewDatabase().
+	// Verify data is still there
+	val, _ := db.Get("key1")
+	fmt.Printf("Value after compaction: %s (Expected: value_9999)\n", val)
 }
