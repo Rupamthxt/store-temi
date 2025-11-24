@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -28,6 +30,13 @@ type Database struct {
 	// A RWMutex allows many concurrent readers OR one exclusive writer.
 	// This is critical for performance and safety.
 	mu sync.RWMutex
+}
+
+// Query defines a simple filter condition.
+type Query struct {
+	Field    string      // e.g., "age"
+	Operator string      // e.g., "eq" (==), "gt" (>), "lt" (<)
+	Value    interface{} // e.g., 25
 }
 
 // headerSize is the fixed size of our entry header in bytes.
@@ -336,31 +345,117 @@ func (db *Database) Compact() error {
 	return nil
 }
 
-func main() {
-	dbPath := "my_test.db"
-	os.Remove(dbPath) // Start fresh
+// Select performs a full table scan to find documents matching the query.
+// It returns a list of matching JSON strings.
+func (db *Database) Select(q Query) ([]string, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
 
+	var results []string
+
+	// Iterate over every key in our in-memory index
+	for key, _ := range db.keyDir {
+		// 1. Get the raw value (this uses our existing Get logic)
+		jsonStr, err := db.Get(key)
+		if err != nil {
+			continue // Skip corrupted/missing records
+		}
+
+		// 2. Parse the JSON
+		// We use a generic map because we don't know the schema ahead of time.
+		var doc map[string]interface{}
+		if err := json.Unmarshal([]byte(jsonStr), &doc); err != nil {
+			continue // Skip non-JSON values
+		}
+
+		// 3. Extract the field we are looking for
+		fieldVal, exists := doc[q.Field]
+		if !exists {
+			continue
+		}
+
+		// 4. Compare (The Logic)
+		match := false
+
+		switch q.Operator {
+		case "eq":
+			// Equality check
+			if fieldVal == q.Value {
+				match = true
+			}
+		case "gt":
+			// Greater Than (numbers only)
+			// JSON numbers are float64 in Go generic maps
+			if v, ok := fieldVal.(float64); ok {
+				if target, ok := q.Value.(float64); ok {
+					if v > target {
+						match = true
+					}
+				}
+			}
+		case "contains":
+			// String contains
+			if v, ok := fieldVal.(string); ok {
+				if target, ok := q.Value.(string); ok {
+					if strings.Contains(v, target) {
+						match = true
+					}
+				}
+			}
+		}
+
+		if match {
+			results = append(results, jsonStr)
+		}
+	}
+
+	return results, nil
+}
+
+func main() {
+	dbPath := "users.db"
+	os.Remove(dbPath)
 	db, _ := NewDatabase(dbPath)
 	defer db.Close()
 
-	fmt.Println("Writing updates...")
-	// Write "key1" 10,000 times
-	for i := 0; i < 10000; i++ {
-		db.Set("key1", fmt.Sprintf("value_%d", i))
+	fmt.Println("Seeding data...")
+
+	// Insert JSON documents
+	db.Set("user_1", `{"name": "Alice", "age": 30, "role": "admin"}`)
+	db.Set("user_2", `{"name": "Bob",   "age": 42, "role": "user"}`)
+	db.Set("user_3", `{"name": "Carol", "age": 25, "role": "user"}`)
+	db.Set("user_4", `{"name": "Dave",  "age": 30, "role": "moderator"}`)
+
+	// Query 1: Find all users with age == 30
+	fmt.Println("\n--- Query: Age == 30 ---")
+	results, _ := db.Select(Query{
+		Field:    "age",
+		Operator: "eq",
+		Value:    30.0, // JSON numbers are floats!
+	})
+	for _, r := range results {
+		fmt.Println(r)
 	}
 
-	info, _ := os.Stat(dbPath)
-	fmt.Printf("File size BEFORE compaction: %d bytes\n", info.Size())
-
-	fmt.Println("Compacting...")
-	if err := db.Compact(); err != nil {
-		panic(err)
+	// Query 2: Find all users older than 40
+	fmt.Println("\n--- Query: Age > 40 ---")
+	results, _ = db.Select(Query{
+		Field:    "age",
+		Operator: "gt",
+		Value:    40.0,
+	})
+	for _, r := range results {
+		fmt.Println(r)
 	}
 
-	info, _ = os.Stat(dbPath)
-	fmt.Printf("File size AFTER compaction: %d bytes\n", info.Size())
-
-	// Verify data is still there
-	val, _ := db.Get("key1")
-	fmt.Printf("Value after compaction: %s (Expected: value_9999)\n", val)
+	// Query 3: Find users with role "admin"
+	fmt.Println("\n--- Query: Role == admin ---")
+	results, _ = db.Select(Query{
+		Field:    "role",
+		Operator: "eq",
+		Value:    "admin",
+	})
+	for _, r := range results {
+		fmt.Println(r)
+	}
 }
