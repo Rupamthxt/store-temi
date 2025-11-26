@@ -30,13 +30,18 @@ type Database struct {
 	// A RWMutex allows many concurrent readers OR one exclusive writer.
 	// This is critical for performance and safety.
 	mu sync.RWMutex
+
+	//Key: field name
+	//Value: a map where key=value_to_search, value=list_of_primary_keys
+
+	indexes map[string]map[any][]string
 }
 
 // Query defines a simple filter condition.
 type Query struct {
-	Field    string      // e.g., "age"
-	Operator string      // e.g., "eq" (==), "gt" (>), "lt" (<)
-	Value    interface{} // e.g., 25
+	Field    string // e.g., "age"
+	Operator string // e.g., "eq" (==), "gt" (>), "lt" (<)
+	Value    any    // e.g., 25
 }
 
 // headerSize is the fixed size of our entry header in bytes.
@@ -53,8 +58,9 @@ func NewDatabase(filePath string) (*Database, error) {
 	}
 
 	db := &Database{
-		file:   file,
-		keyDir: make(map[string]LogEntryPointer),
+		file:    file,
+		keyDir:  make(map[string]LogEntryPointer),
+		indexes: make(map[string]map[any][]string),
 	}
 
 	// Now, load the index from the file
@@ -192,34 +198,45 @@ func (db *Database) Set(key string, value string) error {
 		timestamp: timestamp,
 	}
 
+	// We assume the value is JSON. If it's not, we just ignore indexing.
+	var doc map[string]any
+	if err := json.Unmarshal(valueBytes, &doc); err == nil {
+		for field, indexMap := range db.indexes {
+			if val, ok := doc[field]; ok {
+				// Add this key to the index list for this value
+				indexMap[val] = append(indexMap[val], key)
+			}
+		}
+	}
+
 	return nil
 }
 
 // Get retrieves the value for a key from the log file.
-func (db *Database) Get(key string) (string, error) {
-	// 1. Acquire the READ lock.
-	// Multiple threads can read at the same time, but no one can write.
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+// func (db *Database) Get(key string) (string, error) {
+// 	// 1. Acquire the READ lock.
+// 	// Multiple threads can read at the same time, but no one can write.
+// 	db.mu.RLock()
+// 	defer db.mu.RUnlock()
 
-	// 2. Look up the key in the in-memory map
-	entry, ok := db.keyDir[key]
-	if !ok {
-		return "", fmt.Errorf("key not found")
-	}
+// 	// 2. Look up the key in the in-memory map
+// 	entry, ok := db.keyDir[key]
+// 	if !ok {
+// 		return "", fmt.Errorf("key not found")
+// 	}
 
-	// 3. Prepare a buffer to hold the value
-	valueBytes := make([]byte, entry.size)
+// 	// 3. Prepare a buffer to hold the value
+// 	valueBytes := make([]byte, entry.size)
 
-	// 4. Read ONLY the value from the disk
-	// ReadAt is thread-safe and doesn't move the file cursor.
-	_, err := db.file.ReadAt(valueBytes, entry.offset)
-	if err != nil {
-		return "", fmt.Errorf("failed to read value at offset %d: %w", entry.offset, err)
-	}
+// 	// 4. Read ONLY the value from the disk
+// 	// ReadAt is thread-safe and doesn't move the file cursor.
+// 	_, err := db.file.ReadAt(valueBytes, entry.offset)
+// 	if err != nil {
+// 		return "", fmt.Errorf("failed to read value at offset %d: %w", entry.offset, err)
+// 	}
 
-	return string(valueBytes), nil
-}
+// 	return string(valueBytes), nil
+// }
 
 // Compact cleans up the log file by removing stale data.
 func (db *Database) Compact() error {
@@ -353,10 +370,30 @@ func (db *Database) Select(q Query) ([]string, error) {
 
 	var results []string
 
+	// OPTIMIZATION: Use Index if available for Equality checks
+	if q.Operator == "eq" {
+		if indexMap, ok := db.indexes[q.Field]; ok {
+			// We have an index!
+			// Lookup the list of keys directly. O(1) lookup.
+			if keys, found := indexMap[q.Value]; found {
+				// We have the keys, now just fetch the data
+				for _, key := range keys {
+					val, err := db.getInternal(key) // Use the helper!
+					if err == nil {
+						results = append(results, val)
+					}
+				}
+				// Return immediately! No full scan needed.
+				return results, nil
+			}
+			return results, nil // Index exists but value not found
+		}
+	}
+
 	// Iterate over every key in our in-memory index
-	for key, _ := range db.keyDir {
+	for key := range db.keyDir {
 		// 1. Get the raw value (this uses our existing Get logic)
-		jsonStr, err := db.Get(key)
+		jsonStr, err := db.getInternal(key)
 		if err != nil {
 			continue // Skip corrupted/missing records
 		}
@@ -412,6 +449,55 @@ func (db *Database) Select(q Query) ([]string, error) {
 	return results, nil
 }
 
+// CreateIndex tells the DB to index a specific field (e.g., "age").
+func (db *Database) CreateIndex(field string) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if _, exists := db.indexes[field]; exists {
+		return // Already indexed
+	}
+
+	// Initialize the map for this field
+	db.indexes[field] = make(map[interface{}][]string)
+
+	// Re-scan existing data to populate the index
+	// (In a real DB, you'd do this more efficiently, but for now we iterate keys)
+	for key := range db.keyDir {
+		// We have to reuse our internal Get logic here, but we already hold the lock!
+		// WARNING: Calling db.Get() here would Deadlock because Get() tries to Lock() again.
+		// We need a helper that assumes we already have the lock.
+		val, err := db.getInternal(key)
+		if err != nil {
+			continue
+		}
+
+		var doc map[string]interface{}
+		if err := json.Unmarshal([]byte(val), &doc); err != nil {
+			continue
+		}
+
+		if val, ok := doc[field]; ok {
+			db.indexes[field][val] = append(db.indexes[field][val], key)
+		}
+	}
+	fmt.Printf("Index created on field: %s\n", field)
+}
+
+// Helper: read value without locking (caller must hold lock)
+func (db *Database) getInternal(key string) (string, error) {
+	entry, ok := db.keyDir[key]
+	if !ok {
+		return "", fmt.Errorf("key not found")
+	}
+	valueBytes := make([]byte, entry.size)
+	_, err := db.file.ReadAt(valueBytes, entry.offset)
+	if err != nil {
+		return "", fmt.Errorf("failed to read value at offset %d: %w", entry.offset, err)
+	}
+	return string(valueBytes), err
+}
+
 func main() {
 	dbPath := "users.db"
 	os.Remove(dbPath)
@@ -458,4 +544,16 @@ func main() {
 	for _, r := range results {
 		fmt.Println(r)
 	}
+
+	db.CreateIndex("age")
+
+	// 2. Insert data
+	db.Set("user_1", `{"name": "Alice", "age": 30}`)
+	db.Set("user_2", `{"name": "Bob",   "age": 42}`)
+
+	// 3. Query
+	// This should now hit the index path (O(1)) instead of the scan path (O(N))
+	fmt.Println("Querying for age 30...")
+	results, _ = db.Select(Query{"age", "eq", 30.0})
+	fmt.Println(results)
 }
