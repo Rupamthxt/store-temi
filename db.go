@@ -35,6 +35,8 @@ type Database struct {
 	//Value: a map where key=value_to_search, value=list_of_primary_keys
 
 	indexes map[string]map[any][]string
+
+	orderedIndexes map[string]*SkipList
 }
 
 // Query defines a simple filter condition.
@@ -58,9 +60,10 @@ func NewDatabase(filePath string) (*Database, error) {
 	}
 
 	db := &Database{
-		file:    file,
-		keyDir:  make(map[string]LogEntryPointer),
-		indexes: make(map[string]map[any][]string),
+		file:           file,
+		keyDir:         make(map[string]LogEntryPointer),
+		indexes:        make(map[string]map[any][]string),
+		orderedIndexes: make(map[string]*SkipList),
 	}
 
 	// Now, load the index from the file
@@ -201,10 +204,10 @@ func (db *Database) Set(key string, value string) error {
 	// We assume the value is JSON. If it's not, we just ignore indexing.
 	var doc map[string]any
 	if err := json.Unmarshal(valueBytes, &doc); err == nil {
-		for field, indexMap := range db.indexes {
-			if val, ok := doc[field]; ok {
+		for field, sl := range db.orderedIndexes {
+			if val, ok := doc[field].(float64); ok {
 				// Add this key to the index list for this value
-				indexMap[val] = append(indexMap[val], key)
+				sl.Insert(val, key)
 			}
 		}
 	}
@@ -370,6 +373,44 @@ func (db *Database) Select(q Query) ([]string, error) {
 
 	var results []string
 
+	// 1. Check Ordered Index (Best for GT/LT)
+	if sl, ok := db.orderedIndexes[q.Field]; ok {
+		var keys []string
+
+		// Define "Infinity" for open-ended ranges
+		maxFloat := 1.79e+308
+		minFloat := -1.79e+308
+
+		switch q.Operator {
+		case "gt":
+			if v, ok := q.Value.(float64); ok {
+				// From (Value + epsilon) to Infinity
+				keys = sl.RangeSearch(v+0.000001, maxFloat)
+			}
+		case "lt":
+			if v, ok := q.Value.(float64); ok {
+				// From -Infinity to (Value - epsilon)
+				keys = sl.RangeSearch(minFloat, v-0.000001)
+			}
+		case "range": // Special case: Value is []float64{min, max}
+			if rangeVals, ok := q.Value.([]float64); ok && len(rangeVals) == 2 {
+				keys = sl.RangeSearch(rangeVals[0], rangeVals[1])
+			}
+		}
+
+		if len(keys) > 0 {
+			// Fetch actual data
+			for _, key := range keys {
+				val, err := db.getInternal(key)
+				if err == nil {
+					results = append(results, val)
+				}
+			}
+			return results, nil
+		}
+	}
+
+	//2. Chceck hash Index (Best for EQ)
 	// OPTIMIZATION: Use Index if available for Equality checks
 	if q.Operator == "eq" {
 		if indexMap, ok := db.indexes[q.Field]; ok {
@@ -449,39 +490,69 @@ func (db *Database) Select(q Query) ([]string, error) {
 	return results, nil
 }
 
-// CreateIndex tells the DB to index a specific field (e.g., "age").
-func (db *Database) CreateIndex(field string) {
+// // CreateIndex tells the DB to index a specific field (e.g., "age").
+// func (db *Database) CreateIndex(field string) {
+// 	db.mu.Lock()
+// 	defer db.mu.Unlock()
+
+// 	if _, exists := db.indexes[field]; exists {
+// 		return // Already indexed
+// 	}
+
+// 	// Initialize the map for this field
+// 	db.indexes[field] = make(map[interface{}][]string)
+
+// 	// Re-scan existing data to populate the index
+// 	// (In a real DB, you'd do this more efficiently, but for now we iterate keys)
+// 	for key := range db.keyDir {
+// 		// We have to reuse our internal Get logic here, but we already hold the lock!
+// 		// WARNING: Calling db.Get() here would Deadlock because Get() tries to Lock() again.
+// 		// We need a helper that assumes we already have the lock.
+// 		val, err := db.getInternal(key)
+// 		if err != nil {
+// 			continue
+// 		}
+
+// 		var doc map[string]interface{}
+// 		if err := json.Unmarshal([]byte(val), &doc); err != nil {
+// 			continue
+// 		}
+
+// 		if val, ok := doc[field]; ok {
+// 			db.indexes[field][val] = append(db.indexes[field][val], key)
+// 		}
+// 	}
+// 	fmt.Printf("Index created on field: %s\n", field)
+// }
+
+func (db *Database) CreateOrderedIndex(field string) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if _, exists := db.indexes[field]; exists {
-		return // Already indexed
+	if _, exists := db.orderedIndexes[field]; exists {
+		return
 	}
 
-	// Initialize the map for this field
-	db.indexes[field] = make(map[interface{}][]string)
+	sl := NewSkipList()
 
-	// Re-scan existing data to populate the index
-	// (In a real DB, you'd do this more efficiently, but for now we iterate keys)
+	// Populate it with existing data
 	for key := range db.keyDir {
-		// We have to reuse our internal Get logic here, but we already hold the lock!
-		// WARNING: Calling db.Get() here would Deadlock because Get() tries to Lock() again.
-		// We need a helper that assumes we already have the lock.
 		val, err := db.getInternal(key)
 		if err != nil {
 			continue
 		}
 
 		var doc map[string]interface{}
-		if err := json.Unmarshal([]byte(val), &doc); err != nil {
-			continue
-		}
+		json.Unmarshal([]byte(val), &doc)
 
-		if val, ok := doc[field]; ok {
-			db.indexes[field][val] = append(db.indexes[field][val], key)
+		// Only index numeric values for range queries
+		if v, ok := doc[field].(float64); ok {
+			sl.Insert(v, key)
 		}
 	}
-	fmt.Printf("Index created on field: %s\n", field)
+
+	db.orderedIndexes[field] = sl
+	fmt.Printf("Ordered Index created on field: %s\n", field)
 }
 
 // Helper: read value without locking (caller must hold lock)
@@ -545,15 +616,21 @@ func main() {
 		fmt.Println(r)
 	}
 
-	db.CreateIndex("age")
+	db.CreateOrderedIndex("age")
 
 	// 2. Insert data
-	db.Set("user_1", `{"name": "Alice", "age": 30}`)
-	db.Set("user_2", `{"name": "Bob",   "age": 42}`)
+	// db.Set("user_1", `{"name": "Alice", "age": 30}`)
+	// db.Set("user_2", `{"name": "Bob",   "age": 42}`)
+	// db.Set("user_3", `{"name": "Carol", "age": 10}`)
 
-	// 3. Query
-	// This should now hit the index path (O(1)) instead of the scan path (O(N))
-	fmt.Println("Querying for age 30...")
-	results, _ = db.Select(Query{"age", "eq", 30.0})
-	fmt.Println(results)
+	// Query: Age > 20
+	fmt.Println("\n--- Query: Age > 20 (Using SkipList) ---")
+	results, _ = db.Select(Query{
+		Field:    "age",
+		Operator: "lt",
+		Value:    45.0,
+	})
+	for _, r := range results {
+		fmt.Println(r)
+	}
 }
