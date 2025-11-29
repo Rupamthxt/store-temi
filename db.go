@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,7 @@ type Database struct {
 	indexes map[string]map[any][]string
 
 	orderedIndexes map[string]*SkipList
+	vectorIndex    map[string][]float64
 }
 
 // Query defines a simple filter condition.
@@ -44,6 +46,12 @@ type Query struct {
 	Field    string // e.g., "age"
 	Operator string // e.g., "eq" (==), "gt" (>), "lt" (<)
 	Value    any    // e.g., 25
+}
+
+type SearchResult struct {
+	Key   string
+	Score float64
+	Value string // The full JSON document
 }
 
 // headerSize is the fixed size of our entry header in bytes.
@@ -64,6 +72,7 @@ func NewDatabase(filePath string) (*Database, error) {
 		keyDir:         make(map[string]LogEntryPointer),
 		indexes:        make(map[string]map[any][]string),
 		orderedIndexes: make(map[string]*SkipList),
+		vectorIndex:    make(map[string][]float64),
 	}
 
 	// Now, load the index from the file
@@ -208,6 +217,27 @@ func (db *Database) Set(key string, value string) error {
 			if val, ok := doc[field].(float64); ok {
 				// Add this key to the index list for this value
 				sl.Insert(val, key)
+			}
+		}
+	}
+
+	// 8. Update Vector Index (NEW)
+	// We look for a field named "vector" which is an array of numbers
+	if err := json.Unmarshal(valueBytes, &doc); err == nil {
+		if vecInterface, ok := doc["vector"].([]interface{}); ok {
+			// Convert []interface{} to []float64
+			vec := make([]float64, len(vecInterface))
+			valid := true
+			for i, v := range vecInterface {
+				if f, ok := v.(float64); ok {
+					vec[i] = f
+				} else {
+					valid = false
+					break
+				}
+			}
+			if valid {
+				db.vectorIndex[key] = vec
 			}
 		}
 	}
@@ -569,6 +599,38 @@ func (db *Database) getInternal(key string) (string, error) {
 	return string(valueBytes), err
 }
 
+// SearchVector finds the top K nearest neighbors to the query vector.
+func (db *Database) SearchVector(query []float64, topK int) ([]SearchResult, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	var candidates []SearchResult
+
+	// 1. Scan ALL vectors (Brute Force)
+	for key, vec := range db.vectorIndex {
+		score := CosineSimilarity(query, vec)
+
+		// Optimization: Only keep if score is somewhat relevant (optional)
+		if score > 0 {
+			// We need to fetch the actual value string
+			val, _ := db.getInternal(key)
+			candidates = append(candidates, SearchResult{Key: key, Score: score, Value: val})
+		}
+	}
+
+	// 2. Sort by Score (Descending: High similarity first)
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].Score > candidates[j].Score
+	})
+
+	// 3. Take Top K
+	if len(candidates) > topK {
+		candidates = candidates[:topK]
+	}
+
+	return candidates, nil
+}
+
 func main() {
 	dbPath := "users.db"
 	os.Remove(dbPath)
@@ -618,11 +680,6 @@ func main() {
 
 	db.CreateOrderedIndex("age")
 
-	// 2. Insert data
-	// db.Set("user_1", `{"name": "Alice", "age": 30}`)
-	// db.Set("user_2", `{"name": "Bob",   "age": 42}`)
-	// db.Set("user_3", `{"name": "Carol", "age": 10}`)
-
 	// Query: Age > 20
 	fmt.Println("\n--- Query: Age > 20 (Using SkipList) ---")
 	results, _ = db.Select(Query{
@@ -632,5 +689,24 @@ func main() {
 	})
 	for _, r := range results {
 		fmt.Println(r)
+	}
+
+	fmt.Println("\n--- Seeding Vector Data ---")
+	// Imagine these vectors came from OpenAI's text-embedding-3-small
+	// Dimension 0: Action, Dim 1: Romance, Dim 2: Sci-Fi
+
+	db.Set("movie_1", `{"title": "Mad Max", "vector": [0.9, 0.1, 0.0]}`)
+	db.Set("movie_2", `{"title": "The Notebook", "vector": [0.1, 0.9, 0.0]}`)
+	db.Set("movie_3", `{"title": "Interstellar", "vector": [0.1, 0.0, 0.9]}`)
+	db.Set("movie_4", `{"title": "Terminator", "vector": [0.8, 0.2, 0.1]}`)
+
+	// Query: I want an Action movie (User vector: [1.0, 0.0, 0.0])
+	queryVec := []float64{1.0, 0.0, 0.0}
+
+	fmt.Println("Searching for Action movies...")
+	vecResults, _ := db.SearchVector(queryVec, 2) // Get top 2
+
+	for _, res := range vecResults {
+		fmt.Printf("Score: %.4f | Movie: %s\n", res.Score, res.Value)
 	}
 }
