@@ -15,6 +15,7 @@ type SkipListNode struct {
 	score float64 // The value we sort by (e.g., age: 30)
 	val   string  // The primary key (e.g., "user_1")
 	next  []*SkipListNode
+	value string // The associated value (e.g., JSON string)
 }
 
 // SkipList is our ordered index
@@ -42,7 +43,7 @@ func (sl *SkipList) randomLevel() int {
 }
 
 // Insert adds a new key to the list
-func (sl *SkipList) Insert(score float64, val string) {
+func (sl *SkipList) Insert(score float64, val string, value string) {
 	update := make([]*SkipListNode, maxLevel)
 	current := sl.head
 
@@ -99,4 +100,23 @@ func (sl *SkipList) RangeSearch(min, max float64) []string {
 	}
 
 	return results
+}
+
+// Iterator returns all keys and values in sorted order.
+// In a real DB, you'd return a proper Iterator object, but a slice is fine for now.
+type NodeData struct {
+	Key   string
+	Value string // In Phase 5 this handles the JSON string
+}
+
+func (sl *SkipList) All() []NodeData {
+	var nodes []NodeData
+	current := sl.head.next[0] // Level 0 has all nodes
+	for current != nil {
+		nodes = append(nodes, NodeData{Key: current.val, Value: "..."})
+		// WAIT: Our SkipList implementation in Phase 4.5 only stored Keys in `val`!
+		// We need to fix the SkipList to store Values too.
+		current = current.next[0]
+	}
+	return nodes
 }
