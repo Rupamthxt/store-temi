@@ -1,4 +1,4 @@
-package main
+package index
 
 import (
 	"math/rand"
@@ -13,7 +13,7 @@ const (
 // SkipListNode represents a node in the skip list
 type SkipListNode struct {
 	score float64 // The value we sort by (e.g., age: 30)
-	val   string  // The primary key (e.g., "user_1")
+	key   string  // The primary key (e.g., "user_1")
 	next  []*SkipListNode
 	value string // The associated value (e.g., JSON string)
 }
@@ -43,13 +43,14 @@ func (sl *SkipList) randomLevel() int {
 }
 
 // Insert adds a new key to the list
-func (sl *SkipList) Insert(score float64, val string, value string) {
+func (sl *SkipList) Insert(key string, value string) {
 	update := make([]*SkipListNode, maxLevel)
 	current := sl.head
 
 	// 1. Find the spot where we need to insert
 	for i := sl.level - 1; i >= 0; i-- {
-		for current.next[i] != nil && current.next[i].score < score {
+		// "current.next[i].key < key"
+		for current.next[i] != nil && current.next[i].key < key {
 			current = current.next[i]
 		}
 		update[i] = current
@@ -65,8 +66,8 @@ func (sl *SkipList) Insert(score float64, val string, value string) {
 	}
 
 	newNode := &SkipListNode{
-		score: score,
-		val:   val,
+		key:   key,
+		value: value, // Store the value!
 		next:  make([]*SkipListNode, lvl),
 	}
 
@@ -95,7 +96,7 @@ func (sl *SkipList) RangeSearch(min, max float64) []string {
 
 	// 2. Walk forward until we hit the end of the range (> max)
 	for current != nil && current.score <= max {
-		results = append(results, current.val)
+		results = append(results, current.key)
 		current = current.next[0]
 	}
 
@@ -111,12 +112,38 @@ type NodeData struct {
 
 func (sl *SkipList) All() []NodeData {
 	var nodes []NodeData
-	current := sl.head.next[0] // Level 0 has all nodes
+	current := sl.head.next[0]
 	for current != nil {
-		nodes = append(nodes, NodeData{Key: current.val, Value: "..."})
-		// WAIT: Our SkipList implementation in Phase 4.5 only stored Keys in `val`!
-		// We need to fix the SkipList to store Values too.
+		nodes = append(nodes, NodeData{
+			Key:   current.key,
+			Value: current.value,
+		})
 		current = current.next[0]
 	}
 	return nodes
+}
+
+// Find searches for a key in the SkipList.
+// Returns the value and true if found, or empty string and false if not.
+func (sl *SkipList) Find(key string) (string, bool) {
+	current := sl.head
+
+	// 1. Traverse down from the top level
+	for i := sl.level - 1; i >= 0; i-- {
+		// Move forward as long as the next node's key is LESS than our target
+		for current.next[i] != nil && current.next[i].key < key {
+			current = current.next[i]
+		}
+	}
+
+	// 2. We are now at level 0, sitting exactly *before* where the key should be.
+	// Move one step forward to check the actual node.
+	current = current.next[0]
+
+	// 3. Check for exact match
+	if current != nil && current.key == key {
+		return current.value, true
+	}
+
+	return "", false
 }

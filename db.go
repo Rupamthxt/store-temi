@@ -1,13 +1,10 @@
 package main
 
 import (
-	"encoding/binary"
-	"encoding/json"
+	"custom-db/internal/index"
+	"custom-db/internal/storage"
 	"fmt"
-	"io"
 	"os"
-	"sort"
-	"strings"
 	"sync"
 	"time"
 )
@@ -25,20 +22,15 @@ type LogEntryPointer struct {
 
 // Database is the main struct holding the DB state.
 type Database struct {
-	file   *os.File                   // The log file on disk
-	keyDir map[string]LogEntryPointer // The in-memory index
-
-	// A RWMutex allows many concurrent readers OR one exclusive writer.
-	// This is critical for performance and safety.
+	// The Active MemTable (In-Memory Buffer)
+	// New writes go here. When it fills up, we flush it to disk.
+	memTable *index.SkipList
+	sstables []*storage.SSTableReader
+	// We still need a lock for concurrency
 	mu sync.RWMutex
 
-	//Key: field name
-	//Value: a map where key=value_to_search, value=list_of_primary_keys
-
-	indexes map[string]map[any][]string
-
-	orderedIndexes map[string]*SkipList
-	vectorIndex    map[string][]float64
+	// Directory where we store SSTables (e.g., "./data/")
+	dataDir string
 }
 
 // Query defines a simple filter condition.
@@ -54,471 +46,444 @@ type SearchResult struct {
 	Value string // The full JSON document
 }
 
-// headerSize is the fixed size of our entry header in bytes.
-// 8 bytes (timestamp) + 4 bytes (key_size) + 4 bytes (value_size) = 16 bytes
-const headerSize = 16
-
 // NewDatabase creates a new Database instance, opens the log file,
 // and loads the index from disk.
-func NewDatabase(filePath string) (*Database, error) {
-	// Open the file for reading and writing. Create it if it doesn't exist.
-	file, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open data file: %w", err)
+func NewDatabase(dir string) (*Database, error) {
+	// Ensure the directory exists
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, err
 	}
 
 	db := &Database{
-		file:           file,
-		keyDir:         make(map[string]LogEntryPointer),
-		indexes:        make(map[string]map[any][]string),
-		orderedIndexes: make(map[string]*SkipList),
-		vectorIndex:    make(map[string][]float64),
+		dataDir:  dir,
+		memTable: index.NewSkipList(), // Initialize the empty MemTable
 	}
 
-	// Now, load the index from the file
-	if err := db.loadIndex(); err != nil {
-		return nil, fmt.Errorf("failed to load index: %w", err)
-	}
-
-	fmt.Printf("Database loaded with %d keys.\n", len(db.keyDir))
 	return db, nil
 }
 
-// loadIndex reads the entire log file from the beginning and builds
-// the in-memory keyDir.
-func (db *Database) loadIndex() error {
-	// Acquire a full lock while we are building the index
+// FlushMemTable forces the current MemTable to disk as an SSTable.
+func (db *Database) FlushMemTable() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	// Go to the very beginning of the file
-	_, err := db.file.Seek(0, io.SeekStart)
+	// OPTIMIZATION: Check if it's already empty
+	data := db.memTable.All()
+	if len(data) == 0 {
+		return nil // Nothing to flush!
+	}
+
+	fmt.Println("Flushing MemTable to disk...")
+
+	// 1. Generate a unique filename
+	filename := fmt.Sprintf("data_%d.sst", time.Now().UnixNano())
+
+	// 2. Initialize the Builder
+	builder, err := storage.NewSSTableBuilder(filename)
 	if err != nil {
 		return err
 	}
 
-	var currentOffset int64 = 0
-	headerBuf := make([]byte, headerSize)
+	// 3. Iterate over the SkipList (MemTable)
+	// Note: You need to implement sl.All() to return key/value pairs
 
-	for {
-		// 1. Read the 16-byte header
-		n, err := io.ReadFull(db.file, headerBuf)
-		if err == io.EOF {
-			// We've reached the end of the file. Stop.
-			break
-		}
+	for _, node := range data {
+		err := builder.Add([]byte(node.Key), []byte(node.Value))
 		if err != nil {
-			return fmt.Errorf("error reading header at offset %d: %w", currentOffset, err)
+			return err
 		}
-		if n < headerSize {
-			return fmt.Errorf("read partial header at offset %d, file may be corrupt", currentOffset)
-		}
-
-		// 2. Parse the header
-		// We use BigEndian - this is an arbitrary but consistent choice.
-		timestamp := binary.BigEndian.Uint64(headerBuf[0:8])
-		keySize := binary.BigEndian.Uint32(headerBuf[8:12])
-		valueSize := binary.BigEndian.Uint32(headerBuf[12:16])
-
-		// 3. Read the key
-		keyBytes := make([]byte, keySize)
-		_, err = io.ReadFull(db.file, keyBytes)
-		if err != nil {
-			return fmt.Errorf("error reading key at offset %d: %w", currentOffset, err)
-		}
-		key := string(keyBytes)
-
-		// 4. Create the index entry
-		valueOffset := currentOffset + headerSize + int64(keySize)
-		db.keyDir[key] = LogEntryPointer{
-			offset:    valueOffset,
-			size:      valueSize,
-			timestamp: timestamp,
-		}
-
-		// 5. Seek past the value to the next header
-		// We use SeekCurrent (1) to jump forward from our current position.
-		nextHeaderOffset := valueOffset + int64(valueSize)
-		_, err = db.file.Seek(nextHeaderOffset, io.SeekStart) // Seek from start is safer
-		if err != nil {
-			return fmt.Errorf("error seeking past value at offset %d: %w", currentOffset, err)
-		}
-
-		currentOffset = nextHeaderOffset
 	}
 
-	// IMPORTANT: After reading, make sure the file pointer is at the END
-	// so that our next 'Set' operation appends correctly.
-	_, err = db.file.Seek(0, io.SeekEnd)
-	return err
+	// 4. Finish the file
+	if err := builder.Close(); err != nil {
+		return err
+	}
+
+	// 5. Open it for reading
+	reader, err := storage.NewSSTableReader(filename)
+	if err == nil {
+		// Prepend to the list (Newest files should be checked first!)
+		db.sstables = append([]*storage.SSTableReader{reader}, db.sstables...)
+	}
+
+	// 5. Reset MemTable
+	// We create a fresh SkipList for new writes.
+	// The old one is now safely on disk as an SSTable.
+	db.memTable = index.NewSkipList()
+
+	// 6. Register the new SSTable (Phase 6: The SSTable Reader)
+	// db.sstables = append(db.sstables, filename)
+
+	fmt.Printf("Flush complete: %s created.\n", filename)
+	return nil
 }
+
+// // loadIndex reads the entire log file from the beginning and builds
+// // the in-memory keyDir.
+// func (db *Database) loadIndex() error {
+// 	// Acquire a full lock while we are building the index
+// 	db.mu.Lock()
+// 	defer db.mu.Unlock()
+
+// 	// Go to the very beginning of the file
+// 	_, err := db.file.Seek(0, io.SeekStart)
+// 	if err != nil {
+// 		return err
+// 	}
+
+// 	var currentOffset int64 = 0
+// 	headerBuf := make([]byte, headerSize)
+
+// 	for {
+// 		// 1. Read the 16-byte header
+// 		n, err := io.ReadFull(db.file, headerBuf)
+// 		if err == io.EOF {
+// 			// We've reached the end of the file. Stop.
+// 			break
+// 		}
+// 		if err != nil {
+// 			return fmt.Errorf("error reading header at offset %d: %w", currentOffset, err)
+// 		}
+// 		if n < headerSize {
+// 			return fmt.Errorf("read partial header at offset %d, file may be corrupt", currentOffset)
+// 		}
+
+// 		// 2. Parse the header
+// 		// We use BigEndian - this is an arbitrary but consistent choice.
+// 		timestamp := binary.BigEndian.Uint64(headerBuf[0:8])
+// 		keySize := binary.BigEndian.Uint32(headerBuf[8:12])
+// 		valueSize := binary.BigEndian.Uint32(headerBuf[12:16])
+
+// 		// 3. Read the key
+// 		keyBytes := make([]byte, keySize)
+// 		_, err = io.ReadFull(db.file, keyBytes)
+// 		if err != nil {
+// 			return fmt.Errorf("error reading key at offset %d: %w", currentOffset, err)
+// 		}
+// 		key := string(keyBytes)
+
+// 		// 4. Create the index entry
+// 		valueOffset := currentOffset + headerSize + int64(keySize)
+// 		db.keyDir[key] = LogEntryPointer{
+// 			offset:    valueOffset,
+// 			size:      valueSize,
+// 			timestamp: timestamp,
+// 		}
+
+// 		// 5. Seek past the value to the next header
+// 		// We use SeekCurrent (1) to jump forward from our current position.
+// 		nextHeaderOffset := valueOffset + int64(valueSize)
+// 		_, err = db.file.Seek(nextHeaderOffset, io.SeekStart) // Seek from start is safer
+// 		if err != nil {
+// 			return fmt.Errorf("error seeking past value at offset %d: %w", currentOffset, err)
+// 		}
+
+// 		currentOffset = nextHeaderOffset
+// 	}
+
+// 	// IMPORTANT: After reading, make sure the file pointer is at the END
+// 	// so that our next 'Set' operation appends correctly.
+// 	_, err = db.file.Seek(0, io.SeekEnd)
+// 	return err
+// }
 
 // Close gracefully closes the database file.
-func (db *Database) Close() error {
-	return db.file.Close()
-}
+// func (db *Database) Close() error {
+// 	return db.file.Close()
+// }
 
-// Set appends a key-value pair to the log file and updates the in-memory index.
-func (db *Database) Set(key string, value string) error {
-	// 1. Acquire the EXCLUSIVE lock.
-	// We are modifying the file and the map, so no one else can read or write.
+func (db *Database) Set(key, value string) error {
 	db.mu.Lock()
-	defer db.mu.Unlock()
 
-	// 2. Prepare the data
-	timestamp := uint64(time.Now().Unix())
-	keyBytes := []byte(key)
-	valueBytes := []byte(value)
+	// 1. Write to MemTable
+	db.memTable.Insert(key, value)
 
-	keySize := uint32(len(keyBytes))
-	valueSize := uint32(len(valueBytes))
+	// Check size WHILE locked to ensure thread safety
+	currentSize := len(db.memTable.All())
 
-	// 3. Prepare the header
-	header := make([]byte, headerSize)
-	binary.BigEndian.PutUint64(header[0:8], timestamp)
-	binary.BigEndian.PutUint32(header[8:12], keySize)
-	binary.BigEndian.PutUint32(header[12:16], valueSize)
+	// 2. RELEASE Lock immediately
+	db.mu.Unlock()
 
-	// 4. Seek to the end of the file to ensure we append
-	// This returns the offset where our new record starts.
-	currentOffset, err := db.file.Seek(0, io.SeekEnd)
-	if err != nil {
-		return fmt.Errorf("failed to seek to end: %w", err)
-	}
-
-	// 5. Write the data (Header + Key + Value)
-	// Note: In a production system, you might buffer these writes to a bufio.Writer
-	// and Flush() them to minimize syscalls, but direct Write is safer for now.
-	if _, err := db.file.Write(header); err != nil {
-		return fmt.Errorf("failed to write header: %w", err)
-	}
-	if _, err := db.file.Write(keyBytes); err != nil {
-		return fmt.Errorf("failed to write key: %w", err)
-	}
-	if _, err := db.file.Write(valueBytes); err != nil {
-		return fmt.Errorf("failed to write value: %w", err)
-	}
-
-	// 6. Update the In-Memory Index
-	// We point to where the VALUE starts, which is:
-	// start_of_record + header_size + key_size
-	valueOffset := currentOffset + int64(headerSize) + int64(keySize)
-
-	db.keyDir[key] = LogEntryPointer{
-		offset:    valueOffset,
-		size:      valueSize,
-		timestamp: timestamp,
-	}
-
-	// We assume the value is JSON. If it's not, we just ignore indexing.
-	var doc map[string]any
-	if err := json.Unmarshal(valueBytes, &doc); err == nil {
-		for field, sl := range db.orderedIndexes {
-			if val, ok := doc[field].(float64); ok {
-				// Add this key to the index list for this value
-				sl.Insert(val, key)
-			}
-		}
-	}
-
-	// 8. Update Vector Index (NEW)
-	// We look for a field named "vector" which is an array of numbers
-	if err := json.Unmarshal(valueBytes, &doc); err == nil {
-		if vecInterface, ok := doc["vector"].([]interface{}); ok {
-			// Convert []interface{} to []float64
-			vec := make([]float64, len(vecInterface))
-			valid := true
-			for i, v := range vecInterface {
-				if f, ok := v.(float64); ok {
-					vec[i] = f
-				} else {
-					valid = false
-					break
-				}
-			}
-			if valid {
-				db.vectorIndex[key] = vec
-			}
-		}
+	// 3. Flush if needed (FlushMemTable will acquire its own lock)
+	if currentSize >= 10 {
+		return db.FlushMemTable()
 	}
 
 	return nil
 }
 
 // Get retrieves the value for a key from the log file.
-// func (db *Database) Get(key string) (string, error) {
-// 	// 1. Acquire the READ lock.
-// 	// Multiple threads can read at the same time, but no one can write.
-// 	db.mu.RLock()
-// 	defer db.mu.RUnlock()
-
-// 	// 2. Look up the key in the in-memory map
-// 	entry, ok := db.keyDir[key]
-// 	if !ok {
-// 		return "", fmt.Errorf("key not found")
-// 	}
-
-// 	// 3. Prepare a buffer to hold the value
-// 	valueBytes := make([]byte, entry.size)
-
-// 	// 4. Read ONLY the value from the disk
-// 	// ReadAt is thread-safe and doesn't move the file cursor.
-// 	_, err := db.file.ReadAt(valueBytes, entry.offset)
-// 	if err != nil {
-// 		return "", fmt.Errorf("failed to read value at offset %d: %w", entry.offset, err)
-// 	}
-
-// 	return string(valueBytes), nil
-// }
-
-// Compact cleans up the log file by removing stale data.
-func (db *Database) Compact() error {
-	// 1. Lock the database entirely.
-	// This prevents any reads or writes while we swap files.
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	// 2. Open a temporary new file for writing
-	tempPath := db.file.Name() + ".tmp"
-	newFile, err := os.OpenFile(tempPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
-	}
-
-	// 3. We will iterate through the EXISTING file to find valid data.
-	// We rewind the current file to the start.
-	if _, err := db.file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-
-	var currentOffset int64 = 0
-	headerBuf := make([]byte, headerSize)
-
-	// We need a new map to track offsets in the NEW file
-	newKeyDir := make(map[string]LogEntryPointer)
-	var newOffset int64 = 0
-
-	for {
-		// --- READ STEP (Same as loadIndex) ---
-
-		// Read Header
-		if _, err := io.ReadFull(db.file, headerBuf); err == io.EOF {
-			break
-		} else if err != nil {
-			return err
-		}
-
-		timestamp := binary.BigEndian.Uint64(headerBuf[0:8])
-		keySize := binary.BigEndian.Uint32(headerBuf[8:12])
-		valueSize := binary.BigEndian.Uint32(headerBuf[12:16])
-
-		// Read Key
-		keyBytes := make([]byte, keySize)
-		if _, err := io.ReadFull(db.file, keyBytes); err != nil {
-			return err
-		}
-		key := string(keyBytes)
-
-		// Read Value
-		valueBytes := make([]byte, valueSize)
-		if _, err := io.ReadFull(db.file, valueBytes); err != nil {
-			return err
-		}
-
-		// --- DECISION STEP ---
-
-		// Calculate where the value lived in the OLD file
-		oldValueOffset := currentOffset + headerSize + int64(keySize)
-
-		// Check our current index. Does it point to THIS specific record?
-		// If db.keyDir[key].offset matches, this is the LATEST data. Keep it.
-		// If it doesn't match, it means a newer write happened later. Skip it.
-		if db.keyDir[key].offset == oldValueOffset {
-
-			// --- WRITE STEP ---
-
-			// Write to the NEW file
-			// 1. Header
-			if _, err := newFile.Write(headerBuf); err != nil {
-				return err
-			}
-			// 2. Key
-			if _, err := newFile.Write(keyBytes); err != nil {
-				return err
-			}
-			// 3. Value
-			if _, err := newFile.Write(valueBytes); err != nil {
-				return err
-			}
-
-			// Update our temporary index
-			newValueOffset := newOffset + headerSize + int64(keySize)
-			newKeyDir[key] = LogEntryPointer{
-				offset:    newValueOffset,
-				size:      valueSize,
-				timestamp: timestamp,
-			}
-
-			// Advance new file offset
-			newOffset += int64(headerSize + keySize + valueSize)
-		}
-
-		// Advance old file offset (we read header + key + value)
-		currentOffset += int64(headerSize + keySize + valueSize)
-	}
-
-	// 4. SWAP STEP
-
-	// We have written the new file. Now we need to switch over.
-
-	// Close both files
-	oldPath := db.file.Name()
-	db.file.Close()
-	newFile.Close()
-
-	// Replace the old file with the new one
-	if err := os.Rename(tempPath, oldPath); err != nil {
-		return fmt.Errorf("failed to replace old file: %w", err)
-	}
-
-	// Re-open the file (now pointing to the compacted data)
-	file, err := os.OpenFile(oldPath, os.O_RDWR, 0644)
-	if err != nil {
-		return err
-	}
-	db.file = file
-
-	// Replace the in-memory index
-	db.keyDir = newKeyDir
-
-	fmt.Println("Compaction complete.")
-	return nil
-}
-
-// Select performs a full table scan to find documents matching the query.
-// It returns a list of matching JSON strings.
-func (db *Database) Select(q Query) ([]string, error) {
+func (db *Database) Get(key string) (string, error) {
+	// 1. Acquire the READ lock.
+	// Multiple threads can read at the same time, but no one can write.
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
-	var results []string
+	// 1. Check MemTable (Fastest)
+	// (You need to implement Find on SkipList, returning value + bool)
+	if val, found := db.memTable.Find(key); found {
+		return val, nil
+	}
 
-	// 1. Check Ordered Index (Best for GT/LT)
-	if sl, ok := db.orderedIndexes[q.Field]; ok {
-		var keys []string
-
-		// Define "Infinity" for open-ended ranges
-		maxFloat := 1.79e+308
-		minFloat := -1.79e+308
-
-		switch q.Operator {
-		case "gt":
-			if v, ok := q.Value.(float64); ok {
-				// From (Value + epsilon) to Infinity
-				keys = sl.RangeSearch(v+0.000001, maxFloat)
-			}
-		case "lt":
-			if v, ok := q.Value.(float64); ok {
-				// From -Infinity to (Value - epsilon)
-				keys = sl.RangeSearch(minFloat, v-0.000001)
-			}
-		case "range": // Special case: Value is []float64{min, max}
-			if rangeVals, ok := q.Value.([]float64); ok && len(rangeVals) == 2 {
-				keys = sl.RangeSearch(rangeVals[0], rangeVals[1])
-			}
-		}
-
-		if len(keys) > 0 {
-			// Fetch actual data
-			for _, key := range keys {
-				val, err := db.getInternal(key)
-				if err == nil {
-					results = append(results, val)
-				}
-			}
-			return results, nil
+	// 2. Check SSTables (Newest to Oldest)
+	for _, reader := range db.sstables {
+		val, err := reader.Get(key)
+		if err == nil {
+			return val, nil // Found it!
 		}
 	}
 
-	//2. Chceck hash Index (Best for EQ)
-	// OPTIMIZATION: Use Index if available for Equality checks
-	if q.Operator == "eq" {
-		if indexMap, ok := db.indexes[q.Field]; ok {
-			// We have an index!
-			// Lookup the list of keys directly. O(1) lookup.
-			if keys, found := indexMap[q.Value]; found {
-				// We have the keys, now just fetch the data
-				for _, key := range keys {
-					val, err := db.getInternal(key) // Use the helper!
-					if err == nil {
-						results = append(results, val)
-					}
-				}
-				// Return immediately! No full scan needed.
-				return results, nil
-			}
-			return results, nil // Index exists but value not found
-		}
-	}
-
-	// Iterate over every key in our in-memory index
-	for key := range db.keyDir {
-		// 1. Get the raw value (this uses our existing Get logic)
-		jsonStr, err := db.getInternal(key)
-		if err != nil {
-			continue // Skip corrupted/missing records
-		}
-
-		// 2. Parse the JSON
-		// We use a generic map because we don't know the schema ahead of time.
-		var doc map[string]interface{}
-		if err := json.Unmarshal([]byte(jsonStr), &doc); err != nil {
-			continue // Skip non-JSON values
-		}
-
-		// 3. Extract the field we are looking for
-		fieldVal, exists := doc[q.Field]
-		if !exists {
-			continue
-		}
-
-		// 4. Compare (The Logic)
-		match := false
-
-		switch q.Operator {
-		case "eq":
-			// Equality check
-			if fieldVal == q.Value {
-				match = true
-			}
-		case "gt":
-			// Greater Than (numbers only)
-			// JSON numbers are float64 in Go generic maps
-			if v, ok := fieldVal.(float64); ok {
-				if target, ok := q.Value.(float64); ok {
-					if v > target {
-						match = true
-					}
-				}
-			}
-		case "contains":
-			// String contains
-			if v, ok := fieldVal.(string); ok {
-				if target, ok := q.Value.(string); ok {
-					if strings.Contains(v, target) {
-						match = true
-					}
-				}
-			}
-		}
-
-		if match {
-			results = append(results, jsonStr)
-		}
-	}
-
-	return results, nil
+	return "", fmt.Errorf("key not found")
 }
+
+// Compact cleans up the log file by removing stale data.
+// func (db *Database) Compact() error {
+// 	// 1. Lock the database entirely.
+// 	// This prevents any reads or writes while we swap files.
+// 	db.mu.Lock()
+// 	defer db.mu.Unlock()
+
+// 	// 2. Open a temporary new file for writing
+// 	tempPath := db.file.Name() + ".tmp"
+// 	newFile, err := os.OpenFile(tempPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+// 	if err != nil {
+// 		return fmt.Errorf("failed to create temp file: %w", err)
+// 	}
+
+// 	// 3. We will iterate through the EXISTING file to find valid data.
+// 	// We rewind the current file to the start.
+// 	if _, err := db.file.Seek(0, io.SeekStart); err != nil {
+// 		return err
+// 	}
+
+// 	var currentOffset int64 = 0
+// 	headerBuf := make([]byte, headerSize)
+
+// 	// We need a new map to track offsets in the NEW file
+// 	newKeyDir := make(map[string]LogEntryPointer)
+// 	var newOffset int64 = 0
+
+// 	for {
+// 		// --- READ STEP (Same as loadIndex) ---
+
+// 		// Read Header
+// 		if _, err := io.ReadFull(db.file, headerBuf); err == io.EOF {
+// 			break
+// 		} else if err != nil {
+// 			return err
+// 		}
+
+// 		timestamp := binary.BigEndian.Uint64(headerBuf[0:8])
+// 		keySize := binary.BigEndian.Uint32(headerBuf[8:12])
+// 		valueSize := binary.BigEndian.Uint32(headerBuf[12:16])
+
+// 		// Read Key
+// 		keyBytes := make([]byte, keySize)
+// 		if _, err := io.ReadFull(db.file, keyBytes); err != nil {
+// 			return err
+// 		}
+// 		key := string(keyBytes)
+
+// 		// Read Value
+// 		valueBytes := make([]byte, valueSize)
+// 		if _, err := io.ReadFull(db.file, valueBytes); err != nil {
+// 			return err
+// 		}
+
+// 		// --- DECISION STEP ---
+
+// 		// Calculate where the value lived in the OLD file
+// 		oldValueOffset := currentOffset + headerSize + int64(keySize)
+
+// 		// Check our current index. Does it point to THIS specific record?
+// 		// If db.keyDir[key].offset matches, this is the LATEST data. Keep it.
+// 		// If it doesn't match, it means a newer write happened later. Skip it.
+// 		if db.keyDir[key].offset == oldValueOffset {
+
+// 			// --- WRITE STEP ---
+
+// 			// Write to the NEW file
+// 			// 1. Header
+// 			if _, err := newFile.Write(headerBuf); err != nil {
+// 				return err
+// 			}
+// 			// 2. Key
+// 			if _, err := newFile.Write(keyBytes); err != nil {
+// 				return err
+// 			}
+// 			// 3. Value
+// 			if _, err := newFile.Write(valueBytes); err != nil {
+// 				return err
+// 			}
+
+// 			// Update our temporary index
+// 			newValueOffset := newOffset + headerSize + int64(keySize)
+// 			newKeyDir[key] = LogEntryPointer{
+// 				offset:    newValueOffset,
+// 				size:      valueSize,
+// 				timestamp: timestamp,
+// 			}
+
+// 			// Advance new file offset
+// 			newOffset += int64(headerSize + keySize + valueSize)
+// 		}
+
+// 		// Advance old file offset (we read header + key + value)
+// 		currentOffset += int64(headerSize + keySize + valueSize)
+// 	}
+
+// 	// 4. SWAP STEP
+
+// 	// We have written the new file. Now we need to switch over.
+
+// 	// Close both files
+// 	oldPath := db.file.Name()
+// 	db.file.Close()
+// 	newFile.Close()
+
+// 	// Replace the old file with the new one
+// 	if err := os.Rename(tempPath, oldPath); err != nil {
+// 		return fmt.Errorf("failed to replace old file: %w", err)
+// 	}
+
+// 	// Re-open the file (now pointing to the compacted data)
+// 	file, err := os.OpenFile(oldPath, os.O_RDWR, 0644)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	db.file = file
+
+// 	// Replace the in-memory index
+// 	db.keyDir = newKeyDir
+
+// 	fmt.Println("Compaction complete.")
+// 	return nil
+// }
+
+// Select performs a full table scan to find documents matching the query.
+// It returns a list of matching JSON strings.
+// func (db *Database) Select(q Query) ([]string, error) {
+// 	db.mu.RLock()
+// 	defer db.mu.RUnlock()
+
+// 	var results []string
+
+// 	// 1. Check Ordered Index (Best for GT/LT)
+// 	if sl, ok := db.orderedIndexes[q.Field]; ok {
+// 		var keys []string
+
+// 		// Define "Infinity" for open-ended ranges
+// 		maxFloat := 1.79e+308
+// 		minFloat := -1.79e+308
+
+// 		switch q.Operator {
+// 		case "gt":
+// 			if v, ok := q.Value.(float64); ok {
+// 				// From (Value + epsilon) to Infinity
+// 				keys = sl.RangeSearch(v+0.000001, maxFloat)
+// 			}
+// 		case "lt":
+// 			if v, ok := q.Value.(float64); ok {
+// 				// From -Infinity to (Value - epsilon)
+// 				keys = sl.RangeSearch(minFloat, v-0.000001)
+// 			}
+// 		case "range": // Special case: Value is []float64{min, max}
+// 			if rangeVals, ok := q.Value.([]float64); ok && len(rangeVals) == 2 {
+// 				keys = sl.RangeSearch(rangeVals[0], rangeVals[1])
+// 			}
+// 		}
+
+// 		if len(keys) > 0 {
+// 			// Fetch actual data
+// 			for _, key := range keys {
+// 				val, err := db.getInternal(key)
+// 				if err == nil {
+// 					results = append(results, val)
+// 				}
+// 			}
+// 			return results, nil
+// 		}
+// 	}
+
+// 	//2. Chceck hash Index (Best for EQ)
+// 	// OPTIMIZATION: Use Index if available for Equality checks
+// 	if q.Operator == "eq" {
+// 		if indexMap, ok := db.indexes[q.Field]; ok {
+// 			// We have an index!
+// 			// Lookup the list of keys directly. O(1) lookup.
+// 			if keys, found := indexMap[q.Value]; found {
+// 				// We have the keys, now just fetch the data
+// 				for _, key := range keys {
+// 					val, err := db.getInternal(key) // Use the helper!
+// 					if err == nil {
+// 						results = append(results, val)
+// 					}
+// 				}
+// 				// Return immediately! No full scan needed.
+// 				return results, nil
+// 			}
+// 			return results, nil // Index exists but value not found
+// 		}
+// 	}
+
+// 	// Iterate over every key in our in-memory index
+// 	for key := range db.keyDir {
+// 		// 1. Get the raw value (this uses our existing Get logic)
+// 		jsonStr, err := db.getInternal(key)
+// 		if err != nil {
+// 			continue // Skip corrupted/missing records
+// 		}
+
+// 		// 2. Parse the JSON
+// 		// We use a generic map because we don't know the schema ahead of time.
+// 		var doc map[string]interface{}
+// 		if err := json.Unmarshal([]byte(jsonStr), &doc); err != nil {
+// 			continue // Skip non-JSON values
+// 		}
+
+// 		// 3. Extract the field we are looking for
+// 		fieldVal, exists := doc[q.Field]
+// 		if !exists {
+// 			continue
+// 		}
+
+// 		// 4. Compare (The Logic)
+// 		match := false
+
+// 		switch q.Operator {
+// 		case "eq":
+// 			// Equality check
+// 			if fieldVal == q.Value {
+// 				match = true
+// 			}
+// 		case "gt":
+// 			// Greater Than (numbers only)
+// 			// JSON numbers are float64 in Go generic maps
+// 			if v, ok := fieldVal.(float64); ok {
+// 				if target, ok := q.Value.(float64); ok {
+// 					if v > target {
+// 						match = true
+// 					}
+// 				}
+// 			}
+// 		case "contains":
+// 			// String contains
+// 			if v, ok := fieldVal.(string); ok {
+// 				if target, ok := q.Value.(string); ok {
+// 					if strings.Contains(v, target) {
+// 						match = true
+// 					}
+// 				}
+// 			}
+// 		}
+
+// 		if match {
+// 			results = append(results, jsonStr)
+// 		}
+// 	}
+
+// 	return results, nil
+// }
 
 // // CreateIndex tells the DB to index a specific field (e.g., "age").
 // func (db *Database) CreateIndex(field string) {
@@ -555,158 +520,145 @@ func (db *Database) Select(q Query) ([]string, error) {
 // 	fmt.Printf("Index created on field: %s\n", field)
 // }
 
-func (db *Database) CreateOrderedIndex(field string) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+// func (db *Database) CreateOrderedIndex(field string) {
+// 	db.mu.Lock()
+// 	defer db.mu.Unlock()
 
-	if _, exists := db.orderedIndexes[field]; exists {
-		return
-	}
+// 	if _, exists := db.orderedIndexes[field]; exists {
+// 		return
+// 	}
 
-	sl := NewSkipList()
+// 	sl := NewSkipList()
 
-	// Populate it with existing data
-	for key := range db.keyDir {
-		val, err := db.getInternal(key)
-		if err != nil {
-			continue
-		}
+// 	// Populate it with existing data
+// 	for key := range db.keyDir {
+// 		val, err := db.getInternal(key)
+// 		if err != nil {
+// 			continue
+// 		}
 
-		var doc map[string]interface{}
-		json.Unmarshal([]byte(val), &doc)
+// 		var doc map[string]interface{}
+// 		json.Unmarshal([]byte(val), &doc)
 
-		// Only index numeric values for range queries
-		if v, ok := doc[field].(float64); ok {
-			sl.Insert(v, key)
-		}
-	}
+// 		// Only index numeric values for range queries
+// 		if v, ok := doc[field].(float64); ok {
+// 			sl.Insert(v, key)
+// 		}
+// 	}
 
-	db.orderedIndexes[field] = sl
-	fmt.Printf("Ordered Index created on field: %s\n", field)
-}
+// 	db.orderedIndexes[field] = sl
+// 	fmt.Printf("Ordered Index created on field: %s\n", field)
+// }
 
 // Helper: read value without locking (caller must hold lock)
-func (db *Database) getInternal(key string) (string, error) {
-	entry, ok := db.keyDir[key]
-	if !ok {
-		return "", fmt.Errorf("key not found")
-	}
-	valueBytes := make([]byte, entry.size)
-	_, err := db.file.ReadAt(valueBytes, entry.offset)
-	if err != nil {
-		return "", fmt.Errorf("failed to read value at offset %d: %w", entry.offset, err)
-	}
-	return string(valueBytes), err
-}
+// func (db *Database) getInternal(key string) (string, error) {
+// 	entry, ok := db.keyDir[key]
+// 	if !ok {
+// 		return "", fmt.Errorf("key not found")
+// 	}
+// 	valueBytes := make([]byte, entry.size)
+// 	_, err := db.file.ReadAt(valueBytes, entry.offset)
+// 	if err != nil {
+// 		return "", fmt.Errorf("failed to read value at offset %d: %w", entry.offset, err)
+// 	}
+// 	return string(valueBytes), err
+// }
 
 // SearchVector finds the top K nearest neighbors to the query vector.
-func (db *Database) SearchVector(query []float64, topK int) ([]SearchResult, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+// func (db *Database) SearchVector(query []float64, topK int) ([]SearchResult, error) {
+// 	db.mu.RLock()
+// 	defer db.mu.RUnlock()
 
-	var candidates []SearchResult
+// 	var candidates []SearchResult
 
-	// 1. Scan ALL vectors (Brute Force)
-	for key, vec := range db.vectorIndex {
-		score := CosineSimilarity(query, vec)
+// 	// 1. Scan ALL vectors (Brute Force)
+// 	for key, vec := range db.vectorIndex {
+// 		score := CosineSimilarity(query, vec)
 
-		// Optimization: Only keep if score is somewhat relevant (optional)
-		if score > 0 {
-			// We need to fetch the actual value string
-			val, _ := db.getInternal(key)
-			candidates = append(candidates, SearchResult{Key: key, Score: score, Value: val})
-		}
-	}
+// 		// Optimization: Only keep if score is somewhat relevant (optional)
+// 		if score > 0 {
+// 			// We need to fetch the actual value string
+// 			val, _ := db.getInternal(key)
+// 			candidates = append(candidates, SearchResult{Key: key, Score: score, Value: val})
+// 		}
+// 	}
 
-	// 2. Sort by Score (Descending: High similarity first)
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].Score > candidates[j].Score
-	})
+// 	// 2. Sort by Score (Descending: High similarity first)
+// 	sort.Slice(candidates, func(i, j int) bool {
+// 		return candidates[i].Score > candidates[j].Score
+// 	})
 
-	// 3. Take Top K
-	if len(candidates) > topK {
-		candidates = candidates[:topK]
-	}
+// 	// 3. Take Top K
+// 	if len(candidates) > topK {
+// 		candidates = candidates[:topK]
+// 	}
 
-	return candidates, nil
-}
+// 	return candidates, nil
+// }
 
 func main() {
-	dbPath := "users.db"
-	os.Remove(dbPath)
-	db, _ := NewDatabase(dbPath)
-	defer db.Close()
+	fmt.Println("🚀 Starting Database Engine...")
 
-	fmt.Println("Seeding data...")
-
-	// Insert JSON documents
-	db.Set("user_1", `{"name": "Alice", "age": 30, "role": "admin"}`)
-	db.Set("user_2", `{"name": "Bob",   "age": 42, "role": "user"}`)
-	db.Set("user_3", `{"name": "Carol", "age": 25, "role": "user"}`)
-	db.Set("user_4", `{"name": "Dave",  "age": 30, "role": "moderator"}`)
-
-	// Query 1: Find all users with age == 30
-	fmt.Println("\n--- Query: Age == 30 ---")
-	results, _ := db.Select(Query{
-		Field:    "age",
-		Operator: "eq",
-		Value:    30.0, // JSON numbers are floats!
-	})
-	for _, r := range results {
-		fmt.Println(r)
+	// 1. Setup a clean test directory
+	dbPath := "./data_test"
+	os.RemoveAll(dbPath) // Start fresh every time
+	if err := os.MkdirAll(dbPath, 0755); err != nil {
+		panic(err)
 	}
 
-	// Query 2: Find all users older than 40
-	fmt.Println("\n--- Query: Age > 40 ---")
-	results, _ = db.Select(Query{
-		Field:    "age",
-		Operator: "gt",
-		Value:    40.0,
-	})
-	for _, r := range results {
-		fmt.Println(r)
+	// 2. Initialize the Database
+	db, err := NewDatabase(dbPath)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to initialize DB: %v", err))
 	}
 
-	// Query 3: Find users with role "admin"
-	fmt.Println("\n--- Query: Role == admin ---")
-	results, _ = db.Select(Query{
-		Field:    "role",
-		Operator: "eq",
-		Value:    "admin",
-	})
-	for _, r := range results {
-		fmt.Println(r)
+	// 3. WRITE PHASE
+	// We set the flush threshold to 10 in our Set() function.
+	// We will write 15 items.
+	// - Items 0-9 will trigger a flush and go to DISK (SSTable).
+	// - Items 10-14 will stay in RAM (MemTable).
+	fmt.Println("\n--- ✍️  Write Phase (15 records) ---")
+	for i := 0; i < 15; i++ {
+		key := fmt.Sprintf("user_%02d", i)
+		val := fmt.Sprintf(`{"name": "User %d", "active": true}`, i)
+
+		err := db.Set(key, val)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Printf("Set: %s \tOK\n", key)
 	}
 
-	db.CreateOrderedIndex("age")
+	// 4. READ PHASE
+	fmt.Println("\n--- 📖 Read Phase ---")
 
-	// Query: Age > 20
-	fmt.Println("\n--- Query: Age > 20 (Using SkipList) ---")
-	results, _ = db.Select(Query{
-		Field:    "age",
-		Operator: "lt",
-		Value:    45.0,
-	})
-	for _, r := range results {
-		fmt.Println(r)
+	// Test A: Read from MemTable (Recent data: user_12)
+	fmt.Print("Test A (RAM Check - user_12): ")
+	val, err := db.Get("user_12")
+	if err == nil {
+		fmt.Printf("✅ FOUND -> %s\n", val)
+	} else {
+		fmt.Printf("❌ ERROR -> %v\n", err)
 	}
 
-	fmt.Println("\n--- Seeding Vector Data ---")
-	// Imagine these vectors came from OpenAI's text-embedding-3-small
-	// Dimension 0: Action, Dim 1: Romance, Dim 2: Sci-Fi
-
-	db.Set("movie_1", `{"title": "Mad Max", "vector": [0.9, 0.1, 0.0]}`)
-	db.Set("movie_2", `{"title": "The Notebook", "vector": [0.1, 0.9, 0.0]}`)
-	db.Set("movie_3", `{"title": "Interstellar", "vector": [0.1, 0.0, 0.9]}`)
-	db.Set("movie_4", `{"title": "Terminator", "vector": [0.8, 0.2, 0.1]}`)
-
-	// Query: I want an Action movie (User vector: [1.0, 0.0, 0.0])
-	queryVec := []float64{1.0, 0.0, 0.0}
-
-	fmt.Println("Searching for Action movies...")
-	vecResults, _ := db.SearchVector(queryVec, 2) // Get top 2
-
-	for _, res := range vecResults {
-		fmt.Printf("Score: %.4f | Movie: %s\n", res.Score, res.Value)
+	// Test B: Read from SSTable (Flushed data: user_03)
+	// If this works, your SSTableReader and sparse index are working!
+	fmt.Print("Test B (DISK Check - user_03): ")
+	val, err = db.Get("user_03")
+	if err == nil {
+		fmt.Printf("✅ FOUND -> %s\n", val)
+	} else {
+		fmt.Printf("❌ ERROR -> %v\n", err)
 	}
+
+	// Test C: Read Missing Key
+	fmt.Print("Test C (Miss Check - user_99): ")
+	val, err = db.Get("user_99")
+	if err != nil {
+		fmt.Printf("✅ CORRECTLY MISSED (Error: %v)\n", err)
+	} else {
+		fmt.Printf("❌ UNEXPECTED FOUND -> %s\n", val)
+	}
+
+	fmt.Println("\n🎉 Test Complete.")
 }
