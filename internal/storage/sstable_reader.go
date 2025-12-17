@@ -9,9 +9,10 @@ import (
 )
 
 type SSTableReader struct {
-	file    *os.File
-	index   []IndexEntry // The sparse index (Key -> FileOffset)
-	dataEnd int64        // End of data section (start of index)
+	file     *os.File
+	Filename string
+	index    []IndexEntry // The sparse index (Key -> FileOffset)
+	dataEnd  int64        // End of data section (start of index)
 }
 
 func NewSSTableReader(filePath string) (*SSTableReader, error) {
@@ -59,9 +60,11 @@ func NewSSTableReader(filePath string) (*SSTableReader, error) {
 	}
 
 	// 3. Parse the Index
-	reader := &SSTableReader{file: file,
-		index:   parseIndex(indexBytes),
-		dataEnd: indexOffset,
+	reader := &SSTableReader{
+		file:     file,
+		Filename: filePath,
+		index:    parseIndex(indexBytes),
+		dataEnd:  indexOffset,
 	}
 
 	return reader, nil
