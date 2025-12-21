@@ -1,2 +1,2 @@
 # store-temi
-temi-store is a fully managed vector database.
+store-temi is a fully managed vector database.
