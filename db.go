@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 	"time"
+	"encoding/json"
 )
 
 // LogEntryPointer holds the metadata for a value's location in the log file.
@@ -31,6 +32,8 @@ type Database struct {
 
 	// Directory where we store SSTables (e.g., "./data/")
 	dataDir string
+
+	vectorIndex *index.NSWIndex
 }
 
 // Query defines a simple filter condition.
@@ -57,6 +60,7 @@ func NewDatabase(dir string) (*Database, error) {
 	db := &Database{
 		dataDir:  dir,
 		memTable: index.NewSkipList(), // Initialize the empty MemTable
+		vectorIndex: index.NewNSWIndex(),
 	}
 
 	return db, nil
@@ -343,6 +347,59 @@ func (db *Database) Compact() error {
 
 	fmt.Println("Compaction Complete. Merged into:", outFilename)
 	return nil
+}
+
+
+func (db *Database) rebuildVectorIndex() error {
+    fmt.Println("🔮 Rehydrating Vector Index from Disk...")
+    
+    // We iterate over ALL SSTables (Oldest to Newest usually preferred for updates, 
+    // but since our compaction handles uniqueness, order matters less here unless we have duplicates.
+    // Let's go Newest -> Oldest (db.sstables order) and ignore keys we've already seen.
+    
+    seen := make(map[string]bool)
+
+    for _, reader := range db.sstables {
+        it := reader.NewIterator()
+        for ; it.Valid; it.Next() {
+            if seen[it.Key] {
+                continue // We already have the newer version of this key
+            }
+            
+            // Attempt to parse JSON and extract vector
+            // (We reuse the logic from Set())
+            vec, err := extractVector(it.Value)
+            if err == nil {
+                // ADD TO INDEX
+                // For now, we just add to our map. In Part 2, we will add to the Graph.
+                db.vectorIndex[it.Key] = vec
+            }
+            seen[it.Key] = true
+        }
+    }
+    fmt.Printf("✅ Index Rebuilt. %d vectors loaded.\n", len(db.vectorIndex))
+    return nil
+}
+
+// Helper to parse JSON (Add this to db.go)
+func extractVector(jsonStr string) ([]float64, error) {
+    var doc map[string]interface{}
+    if err := json.Unmarshal([]byte(jsonStr), &doc); err != nil {
+        return nil, err
+    }
+    
+    if vecInterface, ok := doc["vector"].([]interface{}); ok {
+        vec := make([]float64, len(vecInterface))
+        for i, v := range vecInterface {
+            if f, ok := v.(float64); ok {
+                vec[i] = f
+            } else {
+                return nil, fmt.Errorf("invalid vector data")
+            }
+        }
+        return vec, nil
+    }
+    return nil, fmt.Errorf("no vector field")
 }
 
 // Select performs a full table scan to find documents matching the query.
