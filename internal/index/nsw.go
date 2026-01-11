@@ -93,7 +93,12 @@ func (idx *NSWIndex) Search(query []float64, k int) []string {
 	for {
 		madeProgress := false
 		for _, neighborID := range current.Neighbors {
-			neighbor := idx.Nodes[neighborID]
+			// SAFEGUARD: Check if neighbor still exists
+			neighbor, exists := idx.Nodes[neighborID]
+			if !exists {
+				continue // Neighbor was deleted, ignore this edge
+			}
+
 			dist := CosineSimilarity(query, neighbor.Vector)
 
 			if dist > bestDist {
@@ -142,4 +147,18 @@ func (idx *NSWIndex) findNearest(query []float64, k int) []string {
 		ids = append(ids, c.id)
 	}
 	return ids
+}
+
+// Size returns the number of nodes in the vector index safely.
+func (idx *NSWIndex) Size() int {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	return len(idx.Nodes)
+}
+
+func (idx *NSWIndex) Delete(id string) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	delete(idx.Nodes, id)
 }

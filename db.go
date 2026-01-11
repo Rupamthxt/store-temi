@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+const TombstoneValue = "___TOMBSTONE___"
+
 // LogEntryPointer holds the metadata for a value's location in the log file.
 // We'll store this in the in-memory keyDir map.
 type LogEntryPointer struct {
@@ -61,6 +63,10 @@ func NewDatabase(dir string) (*Database, error) {
 		dataDir:     dir,
 		memTable:    index.NewSkipList(), // Initialize the empty MemTable
 		vectorIndex: index.NewNSWIndex(),
+	}
+
+	if err := db.rebuildVectorIndex(); err != nil {
+		fmt.Printf("Warning: Failed to rebuild vector index: %v\n", err)
 	}
 
 	return db, nil
@@ -202,6 +208,10 @@ func (db *Database) Set(key, value string) error {
 	// 1. Write to MemTable
 	db.memTable.Insert(key, value)
 
+	if vec, err := extractVector(value); err == nil {
+		db.vectorIndex.Insert(key, vec)
+	}
+
 	// Check size WHILE locked to ensure thread safety
 	currentSize := len(db.memTable.All())
 
@@ -216,28 +226,43 @@ func (db *Database) Set(key, value string) error {
 	return nil
 }
 
-// Get retrieves the value for a key from the log file.
 func (db *Database) Get(key string) (string, error) {
-	// 1. Acquire the READ lock.
-	// Multiple threads can read at the same time, but no one can write.
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
-	// 1. Check MemTable (Fastest)
-	// (You need to implement Find on SkipList, returning value + bool)
+	// 1. Check MemTable
 	if val, found := db.memTable.Find(key); found {
+		if val == TombstoneValue {
+			return "", fmt.Errorf("key not found (deleted)")
+		}
 		return val, nil
 	}
 
-	// 2. Check SSTables (Newest to Oldest)
+	// 2. Check SSTables
 	for _, reader := range db.sstables {
 		val, err := reader.Get(key)
 		if err == nil {
-			return val, nil // Found it!
+			if val == TombstoneValue {
+				return "", fmt.Errorf("key not found (deleted)")
+			}
+			return val, nil
 		}
 	}
 
 	return "", fmt.Errorf("key not found")
+}
+
+func (db *Database) Delete(key string) error {
+	// 1. Write the Tombstone to disk/memtable
+	if err := db.Set(key, TombstoneValue); err != nil {
+		return err
+	}
+
+	// 2. Remove from Vector Index (Memory)
+	// We need to implement this method next.
+	db.vectorIndex.Delete(key)
+
+	return nil
 }
 
 func (db *Database) Compact() error {
@@ -304,8 +329,10 @@ func (db *Database) Compact() error {
 		winnerVal := iterators[winnerIndex].Value
 
 		// 5. Write to the new file
-		if err := builder.Add([]byte(smallestKey), []byte(winnerVal)); err != nil {
-			return err
+		if winnerVal != TombstoneValue {
+			if err := builder.Add([]byte(smallestKey), []byte(winnerVal)); err != nil {
+				return err
+			}
 		}
 
 		// 6. Advance ALL iterators that had this key
@@ -606,114 +633,67 @@ func extractVector(jsonStr string) ([]float64, error) {
 // }
 
 // SearchVector finds the top K nearest neighbors to the query vector.
-// func (db *Database) SearchVector(query []float64, topK int) ([]SearchResult, error) {
-// 	db.mu.RLock()
-// 	defer db.mu.RUnlock()
+func (db *Database) SearchVector(query []float64, topK int) ([]SearchResult, error) {
+	results := db.vectorIndex.Search(query, topK)
 
-// 	var candidates []SearchResult
-
-// 	// 1. Scan ALL vectors (Brute Force)
-// 	for key, vec := range db.vectorIndex {
-// 		score := CosineSimilarity(query, vec)
-
-// 		// Optimization: Only keep if score is somewhat relevant (optional)
-// 		if score > 0 {
-// 			// We need to fetch the actual value string
-// 			val, _ := db.getInternal(key)
-// 			candidates = append(candidates, SearchResult{Key: key, Score: score, Value: val})
-// 		}
-// 	}
-
-// 	// 2. Sort by Score (Descending: High similarity first)
-// 	sort.Slice(candidates, func(i, j int) bool {
-// 		return candidates[i].Score > candidates[j].Score
-// 	})
-
-// 	// 3. Take Top K
-// 	if len(candidates) > topK {
-// 		candidates = candidates[:topK]
-// 	}
-
-// 	return candidates, nil
-// }
+	var output []SearchResult
+	for _, key := range results {
+		val, _ := db.Get(key)
+		// Note: Our simple Search() returns IDs. You might want to re-calc score here.
+		output = append(output, SearchResult{Key: key, Value: val, Score: 0.0})
+	}
+	return output, nil
+}
 
 func main() {
 	fmt.Println("🚀 Starting Database Engine...")
 
 	// 1. Setup a clean test directory
 	dbPath := "./data_test"
-	os.RemoveAll(dbPath) // Start fresh every time
-	if err := os.MkdirAll(dbPath, 0755); err != nil {
-		panic(err)
-	}
 
-	// 2. Initialize the Database
 	db, err := NewDatabase(dbPath)
 	if err != nil {
-		panic(fmt.Sprintf("Failed to initialize DB: %v", err))
-	}
-
-	// 3. WRITE PHASE
-	// We set the flush threshold to 10 in our Set() function.
-	// We will write 15 items.
-	// - Items 0-9 will trigger a flush and go to DISK (SSTable).
-	// - Items 10-14 will stay in RAM (MemTable).
-	fmt.Println("\n--- ✍️  Write Phase (15 records) ---")
-	for i := 0; i < 15; i++ {
-		key := fmt.Sprintf("user_%02d", i)
-		val := fmt.Sprintf(`{"name": "User %d", "active": true}`, i)
-
-		err := db.Set(key, val)
-		if err != nil {
-			panic(err)
-		}
-		fmt.Printf("Set: %s \tOK\n", key)
-	}
-
-	// 4. READ PHASE
-	fmt.Println("\n--- 📖 Read Phase ---")
-
-	// Test A: Read from MemTable (Recent data: user_12)
-	fmt.Print("Test A (RAM Check - user_12): ")
-	val, err := db.Get("user_12")
-	if err == nil {
-		fmt.Printf("✅ FOUND -> %s\n", val)
-	} else {
-		fmt.Printf("❌ ERROR -> %v\n", err)
-	}
-
-	// Test B: Read from SSTable (Flushed data: user_03)
-	// If this works, your SSTableReader and sparse index are working!
-	fmt.Print("Test B (DISK Check - user_03): ")
-	val, err = db.Get("user_03")
-	if err == nil {
-		fmt.Printf("✅ FOUND -> %s\n", val)
-	} else {
-		fmt.Printf("❌ ERROR -> %v\n", err)
-	}
-
-	// Test C: Read Missing Key
-	fmt.Print("Test C (Miss Check - user_99): ")
-	val, err = db.Get("user_99")
-	if err != nil {
-		fmt.Printf("✅ CORRECTLY MISSED (Error: %v)\n", err)
-	} else {
-		fmt.Printf("❌ UNEXPECTED FOUND -> %s\n", val)
-	}
-
-	fmt.Println("\n--- 🧹 Compaction Phase ---")
-	// Force a compaction
-	if err := db.Compact(); err != nil {
 		panic(err)
 	}
 
-	// Verify data is still there
-	val, err = db.Get("user_03")
-	if err == nil {
-		fmt.Printf("Post-Compaction Read (user_03): ✅ FOUND -> %s\n", val)
+	fmt.Printf("Database started. Vector Index Size: %d\n", db.vectorIndex.Size())
+
+	// Query for "Action" (High dim 0)
+	query := []float64{1.0, 0.0, 0.0}
+	results, _ := db.SearchVector(query, 1)
+
+	if len(results) > 0 {
+		fmt.Printf("Found match: %s (Score: %.4f)\n", results[0].Key, results[0].Score)
+		fmt.Println("Value:", results[0].Value)
 	} else {
-		fmt.Printf("Post-Compaction Read (user_03): ❌ ERROR -> %v\n", err)
+		fmt.Println("❌ No matches found! Persistence failed.")
 	}
 
-	fmt.Println("\n🎉 Test Complete.")
+	// ... inside main ...
+
+	fmt.Println("\n--- 🗑️  Deletion Phase ---")
+
+	// 1. Delete user_03 (who is on Disk)
+	if err := db.Delete("user_03"); err != nil {
+		panic(err)
+	}
+	fmt.Println("Deleted user_03.")
+
+	// 2. Try to Read it
+	val, err := db.Get("user_03")
+	if err != nil {
+		fmt.Printf("Get(user_03): ✅ CORRECTLY GONE (%v)\n", err)
+	} else {
+		fmt.Printf("Get(user_03): ❌ ZOMBIE FOUND! %s\n", val)
+	}
+
+	// 3. Run Compaction (Should physically remove data)
+	db.Compact()
+
+	// 4. Verify again
+	val, err = db.Get("user_03")
+	if err != nil {
+		fmt.Printf("Post-Compact Get(user_03): ✅ STILL GONE\n")
+	}
+
 }
