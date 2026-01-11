@@ -645,7 +645,7 @@ func (db *Database) SearchVector(query []float64, topK int) ([]SearchResult, err
 	return output, nil
 }
 
-func main() {
+func tests() {
 	fmt.Println("🚀 Starting Database Engine...")
 
 	// 1. Setup a clean test directory
